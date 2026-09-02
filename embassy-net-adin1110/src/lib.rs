@@ -85,7 +85,11 @@ pub const MDIO_PHY_ADDR: u8 = 0x01;
 
 /// MDIO address of the port 2 PHY on the ADIN2111.
 #[cfg(feature = "tc6")]
-const MDIO_PHY_ADDR_PORT2: u8 = 0x02;
+pub const MDIO_PHY_ADDR_PORT2: u8 = 0x02;
+
+/// Number of ports on the ADIN2111. Ports are numbered 1..=`ADIN2111_PORT_COUNT`.
+#[cfg(feature = "tc6")]
+pub const ADIN2111_PORT_COUNT: u8 = 2;
 
 /// Maximum Transmission Unit
 pub const MTU: usize = 1514;
@@ -231,6 +235,19 @@ impl<SPI: SpiDevice> ADIN1110<Tc6<SPI>> {
     /// See [`Tc6::set_protected`].
     pub fn set_protected(&mut self, protected: bool) {
         self.protocol.set_protected(protected);
+    }
+
+    /// Write to fifo ethernet packet memory, sending the frame on the given
+    /// port(s) instead of the [`TxPort`] the driver was created with.
+    /// See [`Tc6::send_frame_to`].
+    pub async fn write_fifo_to(&mut self, frame: &[u8], port: TxPort) -> AEResult<(), SPI::Error> {
+        self.protocol.send_frame_to(frame, port).await
+    }
+
+    /// Read out fifo ethernet packet memory, also reporting the **one based**
+    /// port the frame arrived on. See [`Tc6::read_frame_port`].
+    pub async fn read_fifo_port(&mut self, frame: &mut [u8]) -> AEResult<(u8, usize), SPI::Error> {
+        self.protocol.read_frame_port(frame).await
     }
 }
 
@@ -534,89 +551,109 @@ impl<SPI: SpiDevice, INT: Wait, RST: OutputPin> Runner<'_, Tc6<SPI>, INT, RST> {
     /// Read, handle and acknowledge the MAC status registers, updating the
     /// link state from the PHY interrupt status.
     async fn handle_status(mac: &mut ADIN1110<Tc6<SPI>>, state_chan: &ch::StateRunner<'_>, port_link: &mut [bool; 2]) {
-        let status0 = Status0(mac.read_reg(sr::STATUS0).await.unwrap());
-        let status1 = Status1(mac.read_reg(sr::STATUS1).await.unwrap());
-
-        trace!("SPE CHIP STATUS 0:{:08x} 1:{:08x}", status0.0, status1.0);
-
-        if status0.resetc() {
-            // Only expected right after reset; later on it means the chip
-            // rebooted behind our back (brown-out, watchdog, ...).
-            warn!("SPE CHIP was reset");
-        }
-
-        if status0.phyint() {
-            Self::service_phy_int(mac, state_chan, port_link, MDIO_PHY_ADDR, 0).await;
-        }
-
-        if status1.p2_phyint() {
-            Self::service_phy_int(mac, state_chan, port_link, MDIO_PHY_ADDR_PORT2, 1).await;
-        }
-
-        if status1.tx_ecc_err() {
-            error!("SPI TX_ECC_ERR error");
-        }
-
-        if status1.rx_ecc_err() {
-            error!("SPI RX_ECC_ERR error");
-        }
-
-        if status1.spi_err() {
-            error!("SPI SPI_ERR error");
-        }
-
-        if status0.txfcse() || status1.p2_txfcse() {
-            error!("Ethernet Frame FCS and calc FCS don't match!");
-        }
-
-        // Write-1-to-clear everything we have seen and handled.
-        mac.write_reg(sr::STATUS0, status0.0).await.unwrap();
-        mac.write_reg(sr::STATUS1, status1.0).await.unwrap();
-    }
-
-    /// Service a PHY interrupt: read (and thereby clear) the PHY interrupt
-    /// status registers and update the link state on link changes.
-    async fn service_phy_int(
-        mac: &mut ADIN1110<Tc6<SPI>>,
-        state_chan: &ch::StateRunner<'_>,
-        port_link: &mut [bool; 2],
-        phy_addr: u8,
-        port_idx: usize,
-    ) {
-        let crsm_irq_st = mac
-            .read_cl45(phy_addr, RegsC45::DA1E::CRSM_IRQ_STATUS.into())
-            .await
-            .unwrap();
-
-        let phy_irq_st = mac
-            .read_cl45(phy_addr, RegsC45::DA1F::PHY_SYBSYS_IRQ_STATUS.into())
-            .await
-            .unwrap();
-
-        trace!(
-            "PHY {} CRSM_IRQ_STATUS {:04x} PHY_SUBSYS_IRQ_STATUS {:04x}",
-            phy_addr, crsm_irq_st, phy_irq_st
-        );
-
-        // Link Status Change
-        if phy_irq_st & (1 << 1) != 0 {
-            // The link status bit in AN_STATUS latches low; read twice to get
-            // the current state.
-            let _ = mac.read_cl45(phy_addr, RegsC45::DA7::AN_STATUS.into()).await;
-            let an_status = mac.read_cl45(phy_addr, RegsC45::DA7::AN_STATUS.into()).await.unwrap();
-            let link = an_status & (1 << 2) != 0;
-            port_link[port_idx] = link;
-
-            if link {
-                info!("LINK Changed: port {} Link Up", port_idx + 1);
-            } else {
-                info!("LINK Changed: port {} Link Down", port_idx + 1);
-            }
-
+        if tc6_service_status(mac, port_link).await.unwrap() {
+            // embassy-net has a single link state for the whole device, so the
+            // per-port states are collapsed into "any port is up".
             let any_link = port_link.iter().any(|&l| l);
             state_chan.set_link_state(if any_link { LinkState::Up } else { LinkState::Down });
         }
     }
+}
+
+/// Read, handle and acknowledge the MAC status registers, updating `port_link`
+/// from the PHY interrupt status.
+///
+/// Returns `true` when the link state of a port changed.
+#[cfg(feature = "tc6")]
+async fn tc6_service_status<SPI: SpiDevice>(
+    mac: &mut ADIN1110<Tc6<SPI>>,
+    port_link: &mut [bool; 2],
+) -> AEResult<bool, SPI::Error> {
+    let status0 = Status0(mac.read_reg(sr::STATUS0).await?);
+    let status1 = Status1(mac.read_reg(sr::STATUS1).await?);
+
+    trace!("SPE CHIP STATUS 0:{:08x} 1:{:08x}", status0.0, status1.0);
+
+    if status0.resetc() {
+        // Only expected right after reset; later on it means the chip
+        // rebooted behind our back (brown-out, watchdog, ...).
+        warn!("SPE CHIP was reset");
+    }
+
+    let mut link_changed = false;
+
+    if status0.phyint() {
+        link_changed |= tc6_service_phy_int(mac, port_link, MDIO_PHY_ADDR, 0).await?;
+    }
+
+    if status1.p2_phyint() {
+        link_changed |= tc6_service_phy_int(mac, port_link, MDIO_PHY_ADDR_PORT2, 1).await?;
+    }
+
+    if status1.tx_ecc_err() {
+        error!("SPI TX_ECC_ERR error");
+    }
+
+    if status1.rx_ecc_err() {
+        error!("SPI RX_ECC_ERR error");
+    }
+
+    if status1.spi_err() {
+        error!("SPI SPI_ERR error");
+    }
+
+    if status0.txfcse() || status1.p2_txfcse() {
+        error!("Ethernet Frame FCS and calc FCS don't match!");
+    }
+
+    // Write-1-to-clear everything we have seen and handled.
+    mac.write_reg(sr::STATUS0, status0.0).await?;
+    mac.write_reg(sr::STATUS1, status1.0).await?;
+
+    Ok(link_changed)
+}
+
+/// Service a PHY interrupt: read (and thereby clear) the PHY interrupt status
+/// registers and update `port_link` on link changes.
+///
+/// Returns `true` when the link state of this port changed.
+#[cfg(feature = "tc6")]
+async fn tc6_service_phy_int<SPI: SpiDevice>(
+    mac: &mut ADIN1110<Tc6<SPI>>,
+    port_link: &mut [bool; 2],
+    phy_addr: u8,
+    port_idx: usize,
+) -> AEResult<bool, SPI::Error> {
+    let crsm_irq_st = mac.read_cl45(phy_addr, RegsC45::DA1E::CRSM_IRQ_STATUS.into()).await?;
+
+    let phy_irq_st = mac
+        .read_cl45(phy_addr, RegsC45::DA1F::PHY_SYBSYS_IRQ_STATUS.into())
+        .await?;
+
+    trace!(
+        "PHY {} CRSM_IRQ_STATUS {:04x} PHY_SUBSYS_IRQ_STATUS {:04x}",
+        phy_addr, crsm_irq_st, phy_irq_st
+    );
+
+    // Link Status Change
+    if phy_irq_st & (1 << 1) != 0 {
+        // The link status bit in AN_STATUS latches low; read twice to get
+        // the current state.
+        let _ = mac.read_cl45(phy_addr, RegsC45::DA7::AN_STATUS.into()).await;
+        let an_status = mac.read_cl45(phy_addr, RegsC45::DA7::AN_STATUS.into()).await?;
+        let link = an_status & (1 << 2) != 0;
+        port_link[port_idx] = link;
+
+        if link {
+            info!("LINK Changed: port {} Link Up", port_idx + 1);
+        } else {
+            info!("LINK Changed: port {} Link Down", port_idx + 1);
+        }
+
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 /// Obtain a driver for using the ADIN1110 with [`embassy-net`](https://crates.io/crates/embassy-net),
@@ -767,19 +804,19 @@ const IMASK0_OA: u32 = !0x0000_18FF;
 #[cfg(feature = "tc6")]
 const IMASK1_OA: u32 = !0x0108_1D00;
 
-/// Obtain a driver for using the ADIN2111 with [`embassy-net`](https://crates.io/crates/embassy-net),
-/// using the OPEN Alliance TC6 SPI protocol (`SPI_CFG0` strapped for OPEN Alliance mode).
+/// Reset and configure an ADIN2111 for the OPEN Alliance TC6 SPI protocol.
+///
+/// Shared by [`new_tc6`] and [`new_tc6_port_io`], which differ only in what
+/// they wrap the initialized MAC in.
 #[cfg(feature = "tc6")]
 #[allow(clippy::too_many_lines)]
-pub async fn new_tc6<const N_RX: usize, const N_TX: usize, SPI: SpiDevice, INT: Wait, RST: OutputPin>(
+async fn init_tc6<SPI: SpiDevice, RST: OutputPin>(
     mac_addr: [u8; 6],
-    state: &'_ mut State<N_RX, N_TX>,
     spi_dev: SPI,
-    int: INT,
-    mut reset: RST,
+    reset: &mut RST,
     append_fcs_on_tx: bool,
     tx_port: TxPort,
-) -> (Device<'_>, Runner<'_, Tc6<SPI>, INT, RST>) {
+) -> ADIN1110<Tc6<SPI>> {
     info!("INIT ADIN2111 (OPEN Alliance TC6)");
 
     // Reset sequence
@@ -902,6 +939,28 @@ pub async fn new_tc6<const N_RX: usize, const N_TX: usize, SPI: SpiDevice, INT: 
     config0.set_sync(true);
     mac.write_reg(sr::CONFIG0, config0.0).await.unwrap();
 
+    mac
+}
+
+/// Obtain a driver for using the ADIN2111 with [`embassy-net`](https://crates.io/crates/embassy-net),
+/// using the OPEN Alliance TC6 SPI protocol (`SPI_CFG0` strapped for OPEN Alliance mode).
+///
+/// Every frame is transmitted on `tx_port` and the ingress port of received
+/// frames is not reported, because [`Device`] carries frame bytes and nothing
+/// else. Consumers that need to pick the egress port per frame or to know which
+/// port a frame arrived on want [`new_tc6_port_io`] instead.
+#[cfg(feature = "tc6")]
+pub async fn new_tc6<const N_RX: usize, const N_TX: usize, SPI: SpiDevice, INT: Wait, RST: OutputPin>(
+    mac_addr: [u8; 6],
+    state: &'_ mut State<N_RX, N_TX>,
+    spi_dev: SPI,
+    int: INT,
+    mut reset: RST,
+    append_fcs_on_tx: bool,
+    tx_port: TxPort,
+) -> (Device<'_>, Runner<'_, Tc6<SPI>, INT, RST>) {
+    let mac = init_tc6(mac_addr, spi_dev, &mut reset, append_fcs_on_tx, tx_port).await;
+
     let (runner, device) = ch::new(&mut state.ch_state, ch::driver::HardwareAddress::Ethernet(mac_addr));
     (
         device,
@@ -914,6 +973,120 @@ pub async fn new_tc6<const N_RX: usize, const N_TX: usize, SPI: SpiDevice, INT: 
             _reset: reset,
         },
     )
+}
+
+/// Port aware raw frame I/O for the ADIN2111 in OPEN Alliance TC6 mode.
+///
+/// This is an alternative to [`Device`] + [`Runner`] for consumers that do not
+/// use [`embassy-net`](https://crates.io/crates/embassy-net) and need the
+/// per-frame port information the [`embassy-net-driver-channel`](https://crates.io/crates/embassy-net-driver-channel)
+/// interface has no room for: which port to transmit each frame on, and which
+/// port each received frame arrived on. Use either this or the embassy-net
+/// driver for a given chip, not both: each one owns the SPI device and drives
+/// the MAC-PHY itself.
+///
+/// Ports are numbered 1..=[`ADIN2111_PORT_COUNT`] throughout this API.
+///
+/// Obtain one with [`new_tc6_port_io`].
+#[cfg(feature = "tc6")]
+pub struct PortIo<SPI: SpiDevice, INT, RST> {
+    mac: ADIN1110<Tc6<SPI>>,
+    int: INT,
+    port_link: [bool; ADIN2111_PORT_COUNT as usize],
+    _reset: RST,
+}
+
+#[cfg(feature = "tc6")]
+impl<SPI: SpiDevice, INT: Wait, RST: OutputPin> PortIo<SPI, INT, RST> {
+    /// Number of ports of the device. Ports are numbered 1..=`port_count()`.
+    #[must_use]
+    pub fn port_count(&self) -> u8 {
+        ADIN2111_PORT_COUNT
+    }
+
+    /// Link state of a single, one based, port, as of the last serviced PHY
+    /// interrupt.
+    ///
+    /// Link changes are picked up while [`PortIo::receive`] waits for a frame,
+    /// so a caller that never receives never sees the link come up. Ports
+    /// outside 1..=[`ADIN2111_PORT_COUNT`] report `false`.
+    #[must_use]
+    pub fn link_up(&self, port: u8) -> bool {
+        match usize::from(port).checked_sub(1) {
+            Some(idx) => self.port_link.get(idx).copied().unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// Transmit one frame on the given port(s).
+    ///
+    /// [`TxPort::Flood`] sends a copy on every port: the MAC-PHY selects a
+    /// single egress port per transmitted frame, so this is two transmits over
+    /// SPI and not an atomic operation.
+    ///
+    /// `frame` is the Ethernet frame without the FCS, which is appended by the
+    /// host or by the MAC according to the `append_fcs_on_tx` argument of
+    /// [`new_tc6_port_io`]. Short frames are zero padded to the minimum
+    /// Ethernet frame length.
+    pub async fn send(&mut self, frame: &[u8], port: TxPort) -> AEResult<(), SPI::Error> {
+        self.mac.write_fifo_to(frame, port).await
+    }
+
+    /// Wait for a frame, returning the one based port it arrived on and the
+    /// number of bytes written into `buf`.
+    ///
+    /// The frame is written into `buf` without its FCS, which is validated and
+    /// stripped. MAC status (including link changes) is serviced while waiting,
+    /// which is also what deasserts `INT_N`.
+    ///
+    /// Dropping the returned future can leave a partially reassembled frame in
+    /// the driver; the next call picks it up where this one left off.
+    pub async fn receive(&mut self, buf: &mut [u8]) -> AEResult<(u8, usize), SPI::Error> {
+        loop {
+            if !self.mac.protocol.rx_available() && !self.mac.protocol.ext_status() {
+                debug!("Waiting for interrupts");
+                // A failing interrupt pin is ignored, like `Runner::run` does:
+                // the poll below still makes progress, just without waiting.
+                let _ = self.int.wait_for_low().await;
+                // Fetch a footer to learn the current RCA/TXC/EXST.
+                self.mac.protocol.poll_status().await?;
+            }
+
+            if self.mac.protocol.ext_status() {
+                tc6_service_status(&mut self.mac, &mut self.port_link).await?;
+                self.mac.protocol.clear_ext_status();
+            }
+
+            if self.mac.protocol.rx_available() {
+                return self.mac.read_fifo_port(buf).await;
+            }
+        }
+    }
+}
+
+/// Obtain port aware raw frame I/O for the ADIN2111, using the OPEN Alliance
+/// TC6 SPI protocol (`SPI_CFG0` strapped for OPEN Alliance mode).
+///
+/// Unlike [`new_tc6`] this does not involve embassy-net: there is no
+/// [`Device`], no [`State`] and no [`Runner`] to spawn, just a [`PortIo`] to
+/// send and receive frames on directly, with the port of each frame.
+#[cfg(feature = "tc6")]
+pub async fn new_tc6_port_io<SPI: SpiDevice, INT: Wait, RST: OutputPin>(
+    mac_addr: [u8; 6],
+    spi_dev: SPI,
+    int: INT,
+    mut reset: RST,
+    append_fcs_on_tx: bool,
+) -> PortIo<SPI, INT, RST> {
+    // Every send names its own port, so the configured default is never used.
+    let mac = init_tc6(mac_addr, spi_dev, &mut reset, append_fcs_on_tx, TxPort::Port1).await;
+
+    PortIo {
+        mac,
+        int,
+        port_link: [false; ADIN2111_PORT_COUNT as usize],
+        _reset: reset,
+    }
 }
 
 #[allow(clippy::similar_names)]
