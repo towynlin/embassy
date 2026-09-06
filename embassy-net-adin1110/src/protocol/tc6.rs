@@ -129,6 +129,40 @@ impl Footer {
     fn txc(self) -> u8 {
         ((self.0 >> 1) & 0x1F) as u8
     }
+    /// Vendor specific field (bits 23:22), the receive mirror of the transmit
+    /// header's VS field this driver uses to select the egress port.
+    ///
+    /// The OPEN Alliance specification leaves these two bits to the vendor.
+    /// Analog Devices' reference driver (`adi_spi_oa.h`, `adi_spi_oa.c`) places
+    /// `VS:2` here in `adi_mac_OaRxFooter_t`, with every other field of that
+    /// bitfield matching the accessors above, and reads it only from the footer
+    /// of a chunk that starts a frame (SV=1):
+    ///
+    /// ```c
+    /// if (oaRxFooter.SV) {
+    ///     uint32_t vs = oaRxFooter.VS;
+    ///     adi_mac_RxFifoPrio_e prio = (adi_mac_RxFifoPrio_e)((vs & 0x2) >> 1);
+    /// #if defined(ADIN2111)
+    ///     ...pBufDesc->port = vs & 0x1;
+    /// #endif
+    /// ```
+    ///
+    /// So bit 0 is the ingress port and bit 1 is the receive FIFO priority.
+    /// The same driver writes the egress port as `oaTxHeader.VS = port & 0x1`,
+    /// which is what [`Tc6::data_header`] does.
+    #[allow(clippy::cast_possible_truncation)]
+    fn vs(self) -> u8 {
+        ((self.0 >> DATA_HDR_VS_SHIFT) & 0x3) as u8
+    }
+    /// Zero based ingress port of the frame starting in this chunk (0 = port 1).
+    ///
+    /// Only meaningful when [`Footer::sv`] is set, and only on the two port
+    /// ADIN2111: ADI's reference driver reads the port out of VS under
+    /// `#if defined(ADIN2111)`, and `adi_mac.h` documents the field it lands in
+    /// as "Port (0/1) on which the frame will transmitted/received".
+    fn rx_port(self) -> u8 {
+        self.vs() & 0x1
+    }
 }
 
 /// Destination port(s) for transmitted frames on the ADIN2111.
@@ -143,6 +177,35 @@ pub enum TxPort {
     Port2,
     /// Transmit every frame on both ports, like an unmanaged switch flooding.
     Flood,
+}
+
+impl TxPort {
+    /// The `TxPort` for a **one based** port number, or `None` if there is no
+    /// such port.
+    ///
+    /// This is the inverse of [`TxPort::port_number`], and the counterpart of
+    /// the one based port [`Tc6::read_frame_port`] reports, so a frame can be
+    /// forwarded back out of the port it arrived on without doing the
+    /// arithmetic by hand.
+    #[must_use]
+    pub fn from_port_number(port: u8) -> Option<Self> {
+        match port {
+            1 => Some(TxPort::Port1),
+            2 => Some(TxPort::Port2),
+            _ => None,
+        }
+    }
+
+    /// The **one based** port number, or `None` for [`TxPort::Flood`], which
+    /// names every port rather than one.
+    #[must_use]
+    pub fn port_number(self) -> Option<u8> {
+        match self {
+            TxPort::Port1 => Some(1),
+            TxPort::Port2 => Some(2),
+            TxPort::Flood => None,
+        }
+    }
 }
 
 /// TC6 (OPEN Alliance) protocol implementation.
@@ -165,6 +228,9 @@ pub struct Tc6<SPI> {
     rx_len: usize,
     /// A frame start (SV) was seen and its end (EV) is still pending.
     in_frame: bool,
+    /// Zero based ingress port of the frame being reassembled, latched from the
+    /// VS field of the footer that started it. See [`Footer::rx_port`].
+    rx_port: u8,
     /// `CONFIG0.PROTE` is set: every control data word is followed by its
     /// bitwise complement, in both directions.
     protected: bool,
@@ -183,6 +249,7 @@ impl<SPI> Tc6<SPI> {
             rx_buf: [0; MAX_FRAME_SIZE],
             rx_len: 0,
             in_frame: false,
+            rx_port: 0,
             protected: false,
         }
     }
@@ -235,6 +302,10 @@ impl<SPI> Tc6<SPI> {
         }
         if dv {
             val |= DATA_HDR_DV;
+            // Egress port, in the vendor specific field. ADI's reference driver
+            // sets `oaTxHeader.VS` on the first chunk of a frame only; setting
+            // it on every data chunk of the frame presents the MAC-PHY with the
+            // same value, since every chunk of one frame carries one port.
             val |= u32::from(port) << DATA_HDR_VS_SHIFT;
         }
         if sv {
@@ -313,13 +384,14 @@ impl<SPI: SpiDevice> Tc6<SPI> {
 
     /// Process the payload of one receive chunk according to its footer.
     ///
-    /// Returns `Ok(Some(frame_len))` when a complete frame was copied into `out`.
+    /// Returns `Ok(Some((port, frame_len)))` when a complete frame was copied
+    /// into `out`, where `port` is the zero based port it arrived on.
     fn process_rx_chunk(
         &mut self,
         payload: &[u8; CHUNK_PAYLOAD_SIZE],
         footer: Footer,
         out: &mut [u8],
-    ) -> Result<Option<usize>, AdinError<SPI::Error>> {
+    ) -> Result<Option<(u8, usize)>, AdinError<SPI::Error>> {
         if !footer.dv() {
             return Ok(None);
         }
@@ -341,13 +413,14 @@ impl<SPI: SpiDevice> Tc6<SPI> {
                 if self.in_frame {
                     trace!("TC6 RX: SV while in frame, dropping partial frame");
                 }
-                self.in_frame = true;
-                self.rx_len = 0;
+                self.start_frame(footer);
                 self.append_rx(&payload[sbo..=ebo])?;
                 self.finish_frame(out).map(Some)
             }
             (true, true) => {
-                // End of the previous frame plus start of a new frame.
+                // End of the previous frame plus start of a new frame. The
+                // frame that ends here keeps the port latched when it started;
+                // the VS field of this footer belongs to the frame that starts.
                 let finished = if self.in_frame {
                     self.append_rx(&payload[0..=ebo])?;
                     Some(self.finish_frame(out))
@@ -355,8 +428,7 @@ impl<SPI: SpiDevice> Tc6<SPI> {
                     trace!("TC6 RX: EV without frame start, ignored");
                     None
                 };
-                self.in_frame = true;
-                self.rx_len = 0;
+                self.start_frame(footer);
                 self.append_rx(&payload[sbo..])?;
                 match finished {
                     Some(res) => res.map(Some),
@@ -367,8 +439,7 @@ impl<SPI: SpiDevice> Tc6<SPI> {
                 if self.in_frame {
                     trace!("TC6 RX: SV while in frame, dropping partial frame");
                 }
-                self.in_frame = true;
-                self.rx_len = 0;
+                self.start_frame(footer);
                 self.append_rx(&payload[sbo..])?;
                 Ok(None)
             }
@@ -390,6 +461,17 @@ impl<SPI: SpiDevice> Tc6<SPI> {
         }
     }
 
+    /// Begin reassembling a new frame, latching the port it arrived on.
+    ///
+    /// The ingress port is only reported in the footer of the chunk that starts
+    /// the frame, so it is captured here and carried through reassembly. VS in
+    /// the footers of any later chunk of the same frame is ignored.
+    fn start_frame(&mut self, footer: Footer) {
+        self.in_frame = true;
+        self.rx_len = 0;
+        self.rx_port = footer.rx_port();
+    }
+
     fn append_rx(&mut self, data: &[u8]) -> Result<(), AdinError<SPI::Error>> {
         if self.rx_len + data.len() > self.rx_buf.len() {
             self.in_frame = false;
@@ -402,8 +484,11 @@ impl<SPI: SpiDevice> Tc6<SPI> {
     }
 
     /// Validate the assembled frame, strip the FCS and copy it into `out`.
-    fn finish_frame(&mut self, out: &mut [u8]) -> Result<usize, AdinError<SPI::Error>> {
+    ///
+    /// Returns the zero based port the frame arrived on and its length.
+    fn finish_frame(&mut self, out: &mut [u8]) -> Result<(u8, usize), AdinError<SPI::Error>> {
         let total = self.rx_len;
+        let port = self.rx_port;
         self.in_frame = false;
         self.rx_len = 0;
 
@@ -422,7 +507,7 @@ impl<SPI: SpiDevice> Tc6<SPI> {
         }
 
         out[0..len].copy_from_slice(&self.rx_buf[0..len]);
-        Ok(len)
+        Ok((port, len))
     }
 
     /// Transmit one frame on one port, in chunks, respecting TX credits.
@@ -482,6 +567,90 @@ impl<SPI: SpiDevice> Tc6<SPI> {
         }
 
         Ok(())
+    }
+
+    /// Receive one frame and report the port it arrived on.
+    ///
+    /// Returns the **one based** ingress port (1 or 2 on the ADIN2111) and the
+    /// number of bytes written into `frame`, FCS stripped.
+    ///
+    /// The port is taken from the VS field of the footer of the chunk that
+    /// started the frame, see [`Footer::rx_port`]. ADI's reference driver only
+    /// reads that field on the two port ADIN2111, so on the single port
+    /// ADIN1110 the reported port is whatever its footer leaves in VS.
+    ///
+    /// This is the receive half of the port aware raw path; the transmit half
+    /// is [`Tc6::send_frame_to`]. [`Adin1110Protocol::read_fifo`] is the same
+    /// thing without the port.
+    pub async fn read_frame_port(&mut self, frame: &mut [u8]) -> Result<(u8, usize), AdinError<SPI::Error>> {
+        let mut polls = 0u32;
+        loop {
+            // Only clock out receive chunks the MAC-PHY has ready.
+            while self.rca == 0 {
+                self.poll_status().await?;
+                if self.rca == 0 {
+                    polls += 1;
+                    if polls > POLL_LIMIT {
+                        return Err(AdinError::TC6_TIMEOUT);
+                    }
+                    embassy_futures::yield_now().await;
+                }
+            }
+
+            let header = Self::data_header(false, false, false, 0, 0, false);
+            let tx_payload = [0u8; CHUNK_PAYLOAD_SIZE];
+            let mut rx_payload = [0u8; CHUNK_PAYLOAD_SIZE];
+            let footer = self.transfer_chunk(header, &tx_payload, &mut rx_payload).await?;
+
+            if let Some((port, len)) = self.process_rx_chunk(&rx_payload, footer, frame)? {
+                return Ok((port + 1, len));
+            }
+        }
+    }
+
+    /// Transmit one frame on the given port(s), overriding the [`TxPort`] the
+    /// driver was created with.
+    ///
+    /// [`TxPort::Flood`] is **two SPI transmits**, not one: the VS field of the
+    /// data chunk header names a single egress port, so a copy is clocked out
+    /// on port 1 and then another on port 2. It is not atomic, it consumes
+    /// transmit credits for both copies, and it can fail after the first copy
+    /// has already gone out on the wire.
+    ///
+    /// This is the transmit half of the port aware raw path; the receive half
+    /// is [`Tc6::read_frame_port`]. [`Adin1110Protocol::write_fifo`] is
+    /// unaffected and keeps using the port the driver was created with.
+    pub async fn send_frame_to(&mut self, frame: &[u8], port: TxPort) -> Result<(), AdinError<SPI::Error>> {
+        // Ethernet header: 6 bytes dst + 6 bytes src + 2 bytes type/len.
+        if frame.len() < (6 + 6 + 2) {
+            return Err(AdinError::PACKET_TOO_SMALL);
+        }
+        if frame.len() > MTU {
+            return Err(AdinError::PACKET_TOO_BIG);
+        }
+
+        // The MAC does not pad short frames; pad to the minimum frame size,
+        // FCS excluded.
+        let pad_len = frame.len().max(ETH_MIN_WITHOUT_FCS_LEN);
+
+        let fcs = if self.append_fcs_on_tx {
+            let mut fcs = ETH_FCS::new(frame);
+            if pad_len > frame.len() {
+                fcs = fcs.update(&[0u8; ETH_MIN_WITHOUT_FCS_LEN][0..pad_len - frame.len()]);
+            }
+            Some(fcs.hton_bytes())
+        } else {
+            None
+        };
+
+        match port {
+            TxPort::Port1 => self.send_frame_on_port(frame, pad_len, fcs, 0).await,
+            TxPort::Port2 => self.send_frame_on_port(frame, pad_len, fcs, 1).await,
+            TxPort::Flood => {
+                self.send_frame_on_port(frame, pad_len, fcs, 0).await?;
+                self.send_frame_on_port(frame, pad_len, fcs, 1).await
+            }
+        }
     }
 }
 
@@ -566,62 +735,11 @@ impl<SPI: SpiDevice> Adin1110Protocol for Tc6<SPI> {
     }
 
     async fn read_fifo(&mut self, frame: &mut [u8]) -> Result<usize, AdinError<Self::SpiError>> {
-        let mut polls = 0u32;
-        loop {
-            // Only clock out receive chunks the MAC-PHY has ready.
-            while self.rca == 0 {
-                self.poll_status().await?;
-                if self.rca == 0 {
-                    polls += 1;
-                    if polls > POLL_LIMIT {
-                        return Err(AdinError::TC6_TIMEOUT);
-                    }
-                    embassy_futures::yield_now().await;
-                }
-            }
-
-            let header = Self::data_header(false, false, false, 0, 0, false);
-            let tx_payload = [0u8; CHUNK_PAYLOAD_SIZE];
-            let mut rx_payload = [0u8; CHUNK_PAYLOAD_SIZE];
-            let footer = self.transfer_chunk(header, &tx_payload, &mut rx_payload).await?;
-
-            if let Some(len) = self.process_rx_chunk(&rx_payload, footer, frame)? {
-                return Ok(len);
-            }
-        }
+        self.read_frame_port(frame).await.map(|(_port, len)| len)
     }
 
     async fn write_fifo(&mut self, frame: &[u8]) -> Result<(), AdinError<Self::SpiError>> {
-        // Ethernet header: 6 bytes dst + 6 bytes src + 2 bytes type/len.
-        if frame.len() < (6 + 6 + 2) {
-            return Err(AdinError::PACKET_TOO_SMALL);
-        }
-        if frame.len() > MTU {
-            return Err(AdinError::PACKET_TOO_BIG);
-        }
-
-        // The MAC does not pad short frames; pad to the minimum frame size,
-        // FCS excluded.
-        let pad_len = frame.len().max(ETH_MIN_WITHOUT_FCS_LEN);
-
-        let fcs = if self.append_fcs_on_tx {
-            let mut fcs = ETH_FCS::new(frame);
-            if pad_len > frame.len() {
-                fcs = fcs.update(&[0u8; ETH_MIN_WITHOUT_FCS_LEN][0..pad_len - frame.len()]);
-            }
-            Some(fcs.hton_bytes())
-        } else {
-            None
-        };
-
-        match self.tx_port {
-            TxPort::Port1 => self.send_frame_on_port(frame, pad_len, fcs, 0).await,
-            TxPort::Port2 => self.send_frame_on_port(frame, pad_len, fcs, 1).await,
-            TxPort::Flood => {
-                self.send_frame_on_port(frame, pad_len, fcs, 0).await?;
-                self.send_frame_on_port(frame, pad_len, fcs, 1).await
-            }
-        }
+        self.send_frame_to(frame, self.tx_port).await
     }
 }
 
@@ -635,6 +753,7 @@ mod tests {
     use embedded_hal_mock::eh1::spi::{Mock as SpiMock, Transaction as SpiTransaction};
 
     use super::*;
+    use crate::ADIN2111_PORT_COUNT;
 
     #[derive(Debug, Default)]
     struct CsPinMock;
@@ -660,9 +779,16 @@ mod tests {
     fn harness(
         expectations: &[SpiTransaction<u8>],
     ) -> (MockTc6, embedded_hal_mock::common::Generic<SpiTransaction<u8>>) {
+        harness_with_port(expectations, TxPort::Port1)
+    }
+
+    fn harness_with_port(
+        expectations: &[SpiTransaction<u8>],
+        tx_port: TxPort,
+    ) -> (MockTc6, embedded_hal_mock::common::Generic<SpiTransaction<u8>>) {
         let spi = SpiMock::new(expectations);
         let spi_dev = ExclusiveDevice::new(spi.clone(), CsPinMock, MockDelay {});
-        (Tc6::new(spi_dev, false, TxPort::Port1), spi)
+        (Tc6::new(spi_dev, false, tx_port), spi)
     }
 
     /// The chunk footer for the given flag bits, with valid parity.
@@ -674,6 +800,29 @@ mod tests {
     const FTR_DV: u32 = 1 << 21;
     const FTR_SV: u32 = 1 << 20;
     const FTR_EV: u32 = 1 << 14;
+
+    /// Receive chunks available, in the footer.
+    const fn ftr_rca(n: u32) -> u32 {
+        n << 24
+    }
+    /// Vendor specific field, in the footer: bit 0 the ingress port, bit 1 the
+    /// receive FIFO priority.
+    const fn ftr_vs(vs: u32) -> u32 {
+        vs << DATA_HDR_VS_SHIFT
+    }
+    /// A 60 byte frame plus its FCS, exactly one 64 byte chunk on the wire.
+    fn frame_with_fcs(len: usize, seed: u8) -> (Vec<u8>, Vec<u8>) {
+        let mut frame = vec![0u8; len];
+        for (i, b) in frame.iter_mut().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                *b = (i as u8).wrapping_mul(7).wrapping_add(seed);
+            }
+        }
+        let mut wire = frame.clone();
+        wire.extend_from_slice(&ETH_FCS::new(&frame).hton_bytes());
+        (frame, wire)
+    }
 
     #[futures_test::test]
     async fn control_read_transaction() {
@@ -1006,5 +1155,248 @@ mod tests {
         assert!(f.ev());
         assert_eq!(f.ebo(), 17);
         assert_eq!(f.txc(), 12);
+    }
+    #[test]
+    fn tx_port_number_round_trip() {
+        // Ports are one based across the whole public API, matching the port
+        // numbers `read_frame_port` reports.
+        for port in 1..=ADIN2111_PORT_COUNT {
+            let tx = TxPort::from_port_number(port).expect("port in range");
+            assert_eq!(tx.port_number(), Some(port));
+        }
+        assert_eq!(TxPort::from_port_number(0), None);
+        assert_eq!(TxPort::from_port_number(3), None);
+        assert_eq!(TxPort::Flood.port_number(), None);
+        // The zero based VS encoding never escapes this module.
+        assert_eq!(TxPort::Port1.port_number(), Some(1));
+    }
+
+    #[test]
+    fn footer_vendor_specific_field() {
+        // On the ADIN2111 the two vendor specific footer bits (23:22) are, per
+        // ADI's `adi_spi_oa.c`, bit 0 the ingress port and bit 1 the receive
+        // FIFO priority. Only the port is reported.
+        for (vs, port) in [(0, 0), (1, 1), (2, 0), (3, 1)] {
+            let f = Footer(FTR_SYNC | FTR_DV | FTR_SV | ftr_vs(vs));
+            assert_eq!(f.vs(), u8::try_from(vs).unwrap(), "vs for VS={}", vs);
+            assert_eq!(f.rx_port(), port, "rx_port for VS={}", vs);
+        }
+
+        // VS sits between DV (21) and RCA (24) and must not disturb either.
+        let f = Footer(FTR_SYNC | FTR_DV | FTR_SV | ftr_vs(3) | ftr_rca(0x1F));
+        assert!(f.dv());
+        assert_eq!(f.rca(), 0x1F);
+        assert_eq!(f.rx_port(), 1);
+    }
+
+    #[futures_test::test]
+    async fn receive_reports_ingress_port() {
+        // The same single chunk frame arriving on each port. VS=0 is port 1,
+        // VS=1 is port 2, and the API reports them one based.
+        for (vs, expect_port) in [(0, 1u8), (1, 2u8)] {
+            let (frame, wire) = frame_with_fcs(60, 0);
+            let rd_header = Tc6::<()>::data_header(false, false, false, 0, 0, false);
+            let expectations = [
+                SpiTransaction::transfer(
+                    tx_chunk(rd_header, &[]),
+                    rx_chunk(
+                        &wire,
+                        footer(FTR_SYNC | FTR_DV | FTR_SV | FTR_EV | (63 << 8) | ftr_vs(vs)),
+                    ),
+                ),
+                SpiTransaction::flush(),
+            ];
+            let (mut tc6, mut spi) = harness(&expectations);
+            tc6.rca = 1;
+
+            let mut out = [0u8; MTU];
+            let (port, n) = tc6.read_frame_port(&mut out).await.expect("read_frame_port");
+            assert_eq!(port, expect_port, "port for VS={}", vs);
+            assert_eq!(n, 60);
+            assert_eq!(&out[0..n], &frame[..]);
+            spi.done();
+        }
+    }
+
+    #[futures_test::test]
+    async fn receive_ignores_vs_on_continuation_chunks() {
+        // The ingress port is only meaningful in the footer of the chunk that
+        // starts the frame. A later chunk of the same frame claiming the other
+        // port must not change the reported port.
+        let (frame, wire) = frame_with_fcs(96, 0);
+
+        let rd_header = Tc6::<()>::data_header(false, false, false, 0, 0, false);
+        let expectations = [
+            // Frame starts, on port 2.
+            SpiTransaction::transfer(
+                tx_chunk(rd_header, &[]),
+                rx_chunk(
+                    &wire[0..64],
+                    footer(FTR_SYNC | FTR_DV | FTR_SV | ftr_vs(1) | ftr_rca(1)),
+                ),
+            ),
+            SpiTransaction::flush(),
+            // Frame ends. This footer's VS says port 1 and is ignored.
+            SpiTransaction::transfer(
+                tx_chunk(rd_header, &[]),
+                rx_chunk(
+                    &wire[64..100],
+                    footer(FTR_SYNC | FTR_DV | FTR_EV | (35 << 8) | ftr_vs(0)),
+                ),
+            ),
+            SpiTransaction::flush(),
+        ];
+        let (mut tc6, mut spi) = harness(&expectations);
+        tc6.rca = 2;
+
+        let mut out = [0u8; MTU];
+        let (port, n) = tc6.read_frame_port(&mut out).await.expect("read_frame_port");
+        assert_eq!(port, 2, "the port latched at frame start wins");
+        assert_eq!(n, 96);
+        assert_eq!(&out[0..n], &frame[..]);
+        spi.done();
+    }
+
+    #[futures_test::test]
+    async fn receive_end_and_start_in_one_chunk() {
+        // A chunk that both ends one frame and starts the next: the ending
+        // frame keeps the port captured when it started, and the VS in this
+        // footer belongs to the frame that starts here.
+        let (frame_a, wire_a) = frame_with_fcs(96, 0);
+        let (frame_b, wire_b) = frame_with_fcs(60, 0x40);
+
+        // Second chunk: bytes 0..36 finish frame A (EBO=35), bytes 40..64 start
+        // frame B (SWO=10, so SBO=40). The four bytes in between are the gap
+        // the word aligned start offset leaves.
+        let mut mixed = vec![0u8; CHUNK_PAYLOAD_SIZE];
+        mixed[0..36].copy_from_slice(&wire_a[64..100]);
+        mixed[40..64].copy_from_slice(&wire_b[0..24]);
+
+        let rd_header = Tc6::<()>::data_header(false, false, false, 0, 0, false);
+        let expectations = [
+            // Frame A starts, on port 1.
+            SpiTransaction::transfer(
+                tx_chunk(rd_header, &[]),
+                rx_chunk(
+                    &wire_a[0..64],
+                    footer(FTR_SYNC | FTR_DV | FTR_SV | ftr_vs(0) | ftr_rca(2)),
+                ),
+            ),
+            SpiTransaction::flush(),
+            // Frame A ends and frame B starts, on port 2.
+            SpiTransaction::transfer(
+                tx_chunk(rd_header, &[]),
+                rx_chunk(
+                    &mixed,
+                    footer(FTR_SYNC | FTR_DV | FTR_EV | (35 << 8) | FTR_SV | (10 << 16) | ftr_vs(1) | ftr_rca(1)),
+                ),
+            ),
+            SpiTransaction::flush(),
+            // Frame B ends.
+            SpiTransaction::transfer(
+                tx_chunk(rd_header, &[]),
+                rx_chunk(&wire_b[24..64], footer(FTR_SYNC | FTR_DV | FTR_EV | (39 << 8))),
+            ),
+            SpiTransaction::flush(),
+        ];
+        let (mut tc6, mut spi) = harness(&expectations);
+        tc6.rca = 3;
+
+        let mut out = [0u8; MTU];
+        let (port, n) = tc6.read_frame_port(&mut out).await.expect("frame A");
+        assert_eq!(port, 1, "the frame ending here kept the port it started on");
+        assert_eq!(n, 96);
+        assert_eq!(&out[0..n], &frame_a[..]);
+
+        let (port, n) = tc6.read_frame_port(&mut out).await.expect("frame B");
+        assert_eq!(port, 2, "the frame starting here took this footer's VS");
+        assert_eq!(n, 60);
+        assert_eq!(&out[0..n], &frame_b[..]);
+        spi.done();
+    }
+
+    #[futures_test::test]
+    async fn transmit_selects_egress_port_per_frame() {
+        // `send_frame_to` puts the port in the VS field of the data chunk
+        // header, independently of the port the driver was created with.
+        for (tx_port, vs) in [(TxPort::Port1, 0), (TxPort::Port2, 1)] {
+            let frame = [0x11u8; 14];
+            let mut payload = [0u8; 60];
+            payload[0..14].copy_from_slice(&frame);
+
+            let wr_header = Tc6::<()>::data_header(true, true, true, 59, vs, true);
+            assert_eq!(
+                (wr_header >> DATA_HDR_VS_SHIFT) & 0x3,
+                u32::from(vs),
+                "header VS for the port at VS={}",
+                vs
+            );
+            let expectations = [
+                SpiTransaction::transfer(
+                    tx_chunk(wr_header, &payload),
+                    rx_chunk(&[], footer(FTR_SYNC | (10 << 1))),
+                ),
+                SpiTransaction::flush(),
+            ];
+            // Created for the *other* port, to show the per-frame choice wins.
+            let (mut tc6, mut spi) = harness_with_port(
+                &expectations,
+                if tx_port == TxPort::Port1 {
+                    TxPort::Port2
+                } else {
+                    TxPort::Port1
+                },
+            );
+            tc6.txc = 31;
+
+            tc6.send_frame_to(&frame, tx_port).await.expect("send_frame_to");
+            spi.done();
+        }
+    }
+
+    #[futures_test::test]
+    async fn transmit_flood_sends_one_copy_per_port() {
+        // The VS field names a single egress port, so flooding is two
+        // transmits: port 1 first, then port 2.
+        let frame = [0x22u8; 14];
+        let mut payload = [0u8; 60];
+        payload[0..14].copy_from_slice(&frame);
+
+        let hdr_p1 = Tc6::<()>::data_header(true, true, true, 59, 0, true);
+        let hdr_p2 = Tc6::<()>::data_header(true, true, true, 59, 1, true);
+        let expectations = [
+            SpiTransaction::transfer(tx_chunk(hdr_p1, &payload), rx_chunk(&[], footer(FTR_SYNC | (20 << 1)))),
+            SpiTransaction::flush(),
+            SpiTransaction::transfer(tx_chunk(hdr_p2, &payload), rx_chunk(&[], footer(FTR_SYNC | (19 << 1)))),
+            SpiTransaction::flush(),
+        ];
+        let (mut tc6, mut spi) = harness(&expectations);
+        tc6.txc = 31;
+
+        tc6.send_frame_to(&frame, TxPort::Flood).await.expect("send_frame_to");
+        spi.done();
+    }
+
+    #[futures_test::test]
+    async fn write_fifo_still_uses_the_configured_port() {
+        // The embassy-net path is unchanged: `write_fifo` transmits on the port
+        // the driver was created with.
+        let frame = [0x33u8; 14];
+        let mut payload = [0u8; 60];
+        payload[0..14].copy_from_slice(&frame);
+
+        let wr_header = Tc6::<()>::data_header(true, true, true, 59, 1, true);
+        let expectations = [
+            SpiTransaction::transfer(
+                tx_chunk(wr_header, &payload),
+                rx_chunk(&[], footer(FTR_SYNC | (10 << 1))),
+            ),
+            SpiTransaction::flush(),
+        ];
+        let (mut tc6, mut spi) = harness_with_port(&expectations, TxPort::Port2);
+        tc6.txc = 31;
+
+        tc6.write_fifo(&frame).await.expect("write_fifo");
+        spi.done();
     }
 }
